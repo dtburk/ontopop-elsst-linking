@@ -1,0 +1,36 @@
+rules_version = '2';
+
+// Firestore security rules for the OntoPop ↔ ELSST review site (docs/).
+// Paste into Firebase console → Firestore Database → Rules, then Publish.
+//
+// There are no logins: reviewers pick a name/affiliation profile, so these
+// rules can't tie a vote to a person. They do keep the data well-formed:
+// anyone may read; profiles can be created but not altered or deleted; votes
+// can only be written into the per-section shard documents the app uses, and
+// no document can be deleted. See REVIEW_SITE.md for hardening options.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /reviewers/{rid} {
+      allow read: if true;
+      allow create: if request.resource.data.keys().hasOnly(['name', 'affiliation', 'created'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 100
+        && request.resource.data.affiliation is string
+        && request.resource.data.affiliation.size() <= 200
+        && request.resource.data.created == request.time;
+      allow update, delete: if false;
+    }
+
+    // One document per OntoPop section: vote_shards/s101 … s933, each
+    //   { v: { "<code>|<elsstUuid>": { <reviewerId>: {t, n, c, u} } } }
+    match /vote_shards/{sid} {
+      allow read: if true;
+      allow create, update: if sid.matches('s[0-9]{3}')
+        && request.resource.data.keys().hasOnly(['v'])
+        && request.resource.data.v is map;
+      allow delete: if false;
+    }
+  }
+}

@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OntoPop Browser</title>
+<style>
+  :root {
+    --bg:#f4f5f7; --card:#fff; --line:#d6d9de; --line2:#e8eaee; --ink:#1f2430; --mut:#6b7280;
+    --accent:#2563eb; --accentbg:#e8efff; --sel:#dbe6ff; --mark:#fff3b0;
+    --exact:#166534; --exactbg:#dcfce7; --close:#0f766e; --closebg:#ccfbf1;
+    --broad:#1e40af; --broadbg:#dbeafe; --narrow:#6b21a8; --narrowbg:#f3e8ff;
+    --related:#92400e; --relatedbg:#fef3c7; --dep:#991b1b; --depbg:#fee2e2;
+    --head:56px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#14161b; --card:#1d2027; --line:#353a45; --line2:#2a2e37; --ink:#e6e8ec; --mut:#9aa1ad;
+      --accent:#7aa2ff; --accentbg:#22304d; --sel:#263a63; --mark:#5a4b12;
+      --exact:#86efac; --exactbg:#173a25; --close:#5eead4; --closebg:#133b37;
+      --broad:#93c5fd; --broadbg:#1c2d4d; --narrow:#d8b4fe; --narrowbg:#35214a;
+      --related:#fcd34d; --relatedbg:#3d3115; --dep:#fca5a5; --depbg:#4a1d1d;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#14161b; --card:#1d2027; --line:#353a45; --line2:#2a2e37; --ink:#e6e8ec; --mut:#9aa1ad;
+    --accent:#7aa2ff; --accentbg:#22304d; --sel:#263a63; --mark:#5a4b12;
+    --exact:#86efac; --exactbg:#173a25; --close:#5eead4; --closebg:#133b37;
+    --broad:#93c5fd; --broadbg:#1c2d4d; --narrow:#d8b4fe; --narrowbg:#35214a;
+    --related:#fcd34d; --relatedbg:#3d3115; --dep:#fca5a5; --depbg:#4a1d1d;
+  }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body { margin:0; font:14px/1.5 -apple-system,"Segoe UI",Roboto,sans-serif;
+         color:var(--ink); background:var(--bg); }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  button, select { font:inherit; color:inherit; background:var(--card);
+                   border:1px solid var(--line); border-radius:6px; padding:4px 10px; cursor:pointer; }
+  button:hover { background:var(--accentbg); }
+  code, .mono { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:12.5px; }
+
+  /* ── Header ─────────────────────────────────────────────────────────── */
+  header { position:sticky; top:0; z-index:10; height:var(--head); background:var(--card);
+           border-bottom:1px solid var(--line); padding:0 16px;
+           display:flex; gap:12px; align-items:center; }
+  header h1 { font-size:15px; margin:0; white-space:nowrap; }
+  header .sub { color:var(--mut); font-size:12px; white-space:nowrap; }
+  header .spacer { flex:1; }
+  .search { position:relative; flex:0 1 360px; min-width:140px; }
+  .search input { width:100%; padding:6px 10px; border:1px solid var(--line); border-radius:6px;
+                  font:inherit; background:var(--bg); color:var(--ink); }
+  .results { position:absolute; top:calc(100% + 4px); left:0; right:0; background:var(--card);
+             border:1px solid var(--line); border-radius:6px; max-height:65vh; overflow-y:auto;
+             box-shadow:0 6px 18px rgba(0,0,0,.12); z-index:20; }
+  .result { padding:7px 10px; cursor:pointer; border-bottom:1px solid var(--line2); }
+  .result:last-child { border-bottom:none; }
+  .result.sel, .result:hover { background:var(--accentbg); }
+  .result .hit { color:var(--mut); font-size:12px; }
+  .hdr-links { display:flex; gap:12px; font-size:13px; white-space:nowrap; }
+
+  /* ── Layout ─────────────────────────────────────────────────────────── */
+  main { display:grid; grid-template-columns:minmax(280px, 380px) 1fr;
+         height:calc(100vh - var(--head)); }
+  #side { border-right:1px solid var(--line); background:var(--card);
+          display:flex; flex-direction:column; min-height:0; }
+  .side-tools { padding:8px 10px; border-bottom:1px solid var(--line2); display:flex; gap:6px;
+                align-items:center; flex-wrap:wrap; font-size:12px; color:var(--mut); }
+  .side-tools button { font-size:12px; padding:2px 8px; }
+  #tree { overflow:auto; padding:6px 0 30px; flex:1; }
+  #detail { overflow:auto; padding:20px 28px 60px; min-width:0; }
+
+  /* ── Tree ───────────────────────────────────────────────────────────── */
+  #tree ul { list-style:none; margin:0; padding:0 0 0 14px; }
+  #tree > ul { padding-left:4px; }
+  #tree li { margin:0; }
+  .node { display:flex; align-items:center; gap:2px; padding:1px 8px 1px 0; border-radius:4px;
+          white-space:nowrap; }
+  .node:hover { background:var(--accentbg); }
+  .node.cur { background:var(--sel); }
+  .caret { width:18px; height:20px; flex:none; border:none; background:none; padding:0;
+           color:var(--mut); font-size:10px; line-height:20px; text-align:center; cursor:pointer; }
+  .caret:hover { color:var(--ink); background:none; }
+  .caret.leaf { visibility:hidden; cursor:default; }
+  .nlabel { cursor:pointer; overflow:hidden; text-overflow:ellipsis; }
+  .ncode { color:var(--mut); font-size:11px; margin-left:5px; }
+  .nbadge { margin-left:6px; font-size:10.5px; line-height:15px; padding:0 5px; border-radius:8px;
+            font-weight:600; flex:none; }
+  .node.dep .nlabel { text-decoration:line-through; color:var(--mut); }
+
+  /* ── Detail ─────────────────────────────────────────────────────────── */
+  .empty { color:var(--mut); margin-top:40px; text-align:center; }
+  .title { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; margin-bottom:2px; }
+  .title h2 { margin:0; font-size:24px; }
+  .chip { display:inline-block; font-size:12px; padding:1px 8px; border-radius:10px;
+          background:var(--line2); color:var(--ink); }
+  .iri { color:var(--mut); font-size:12px; word-break:break-all; margin-bottom:14px; }
+  .crumbs { font-size:13px; color:var(--mut); margin-bottom:6px; }
+  .crumbs a { color:var(--mut); }
+  .crumbs a:hover { color:var(--accent); }
+  section.card { background:var(--card); border:1px solid var(--line); border-radius:8px;
+                 padding:14px 18px; margin:14px 0; }
+  section.card > h3 { margin:0 0 10px; font-size:14px; text-transform:uppercase; letter-spacing:.04em;
+                      color:var(--mut); display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  section.card > h3 .count { text-transform:none; letter-spacing:0; font-weight:400; }
+  dl.kv { display:grid; grid-template-columns:max-content 1fr; gap:6px 16px; margin:0; }
+  dl.kv dt { color:var(--mut); }
+  dl.kv dd { margin:0; min-width:0; }
+  .links a { margin-right:4px; }
+  .links a::after { content:","; color:var(--mut); }
+  .links a:last-child::after { content:""; }
+  .muted { color:var(--mut); }
+  .small { font-size:12px; }
+
+  /* Match-type badges */
+  .badge { display:inline-block; font-size:11.5px; font-weight:600; padding:1px 8px; border-radius:10px;
+           white-space:nowrap; }
+  .t-exactMatch   { color:var(--exact);   background:var(--exactbg); }
+  .t-closeMatch   { color:var(--close);   background:var(--closebg); }
+  .t-broadMatch   { color:var(--broad);   background:var(--broadbg); }
+  .t-narrowMatch  { color:var(--narrow);  background:var(--narrowbg); }
+  .t-relatedMatch { color:var(--related); background:var(--relatedbg); }
+  .dep-badge { color:var(--dep); background:var(--depbg); }
+
+  .filters { display:flex; gap:6px; flex-wrap:wrap; }
+  .filters button { border-radius:12px; font-size:12px; padding:1px 10px; border-width:1px; }
+  .filters button.off { opacity:.4; background:none; }
+  .typegroup + .typegroup { margin-top:4px; }
+  .match { border-top:1px solid var(--line2); padding:10px 0; display:grid;
+           grid-template-columns:110px 1fr; gap:4px 14px; }
+  .match:first-child { border-top:none; }
+  .match .mt { padding-top:2px; }
+  .match .head { display:flex; flex-wrap:wrap; gap:4px 14px; align-items:baseline; }
+  .match .elabel { font-weight:600; font-size:15px; }
+  .cessda { font-size:13px; white-space:nowrap; }
+  .cessda .n { font-weight:600; }
+  .match .def { margin:3px 0 0; }
+  .match .why { margin:4px 0 0; font-style:italic; color:var(--mut); }
+  .match .meta { font-size:12px; color:var(--mut); margin-top:3px; }
+  .match details { font-size:12.5px; margin-top:3px; }
+  .match details summary { cursor:pointer; color:var(--mut); }
+
+  table.labels { border-collapse:collapse; width:100%; }
+  table.labels th, table.labels td { text-align:left; padding:4px 10px 4px 0; vertical-align:top;
+                                     border-bottom:1px solid var(--line2); }
+  table.labels th { color:var(--mut); font-weight:500; font-size:12px; }
+  table.labels td.lg { color:var(--mut); width:52px; }
+  table.labels td.alt { color:var(--mut); }
+
+  .ctx-tools { display:flex; gap:8px; align-items:center; flex-wrap:wrap; text-transform:none;
+               letter-spacing:0; font-weight:400; color:var(--ink); font-size:13px; }
+  .ctx { line-height:1.6; }
+  .ctx p { margin:0 0 8px; }
+  .ctx.gl p { display:inline; margin:0; }
+  .ctx ul { margin:6px 0 0; padding-left:18px; }
+  .ctx li { margin:3px 0; }
+  .ctx a.code { font-size:12px; }
+  .ctx a.code.self { background:var(--mark); color:var(--ink); border-radius:3px; padding:0 2px; }
+  .ctx li.self { background:var(--mark); border-radius:4px; padding:2px 6px; margin-left:-6px; }
+
+  footer { margin-top:30px; color:var(--mut); font-size:12px; }
+
+  /* ── Small screens ──────────────────────────────────────────────────── */
+  @media (max-width: 820px) {
+    :root { --head:auto; }
+    header { flex-wrap:wrap; padding:8px 16px; gap:8px; }
+    header .sub, header .spacer { display:none; }
+    .search { flex:1 1 100%; order:5; }
+    main { display:block; height:auto; }
+    #side { border-right:none; border-bottom:1px solid var(--line); }
+    #tree { max-height:42vh; }
+    #detail { padding:14px 16px 40px; }
+    .match { grid-template-columns:1fr; }
+    dl.kv { grid-template-columns:1fr; gap:2px; }
+    dl.kv dd { margin-bottom:6px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>OntoPop browser</h1>
+  <span class="sub" id="hdr-sub">loading…</span>
+  <div class="spacer"></div>
+  <div class="search">
+    <input id="q" type="search" placeholder="Search classes (any language) or code, e.g. 101-4" autocomplete="off">
+    <div class="results" id="results" hidden></div>
+  </div>
+  <nav class="hdr-links"><a href="index.html">Review site</a></nav>
+</header>
+<main>
+  <aside id="side">
+    <div class="side-tools">
+      <button id="collapse" title="Collapse every branch">Collapse all</button>
+      <button id="reveal" title="Expand the tree to the class on screen">Show current</button>
+      <span>badge = gpt-4o matches, coloured by strongest type</span>
+    </div>
+    <nav id="tree" aria-label="OntoPop class hierarchy"></nav>
+  </aside>
+  <div id="detail"><p class="empty">Loading OntoPop…</p></div>
+</main>
+<script src="browse.js"></script>
+</body>
+</html>
