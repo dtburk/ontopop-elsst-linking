@@ -24,39 +24,60 @@ suppressPackageStartupMessages({
 })
 
 source("R/openai_batch.R")
+source("R/match_rules.R")   # MATCH_TYPE_DEFS, MATCH_TYPE_RULES (shared w/ Phase 5)
+source("R/hierarchy.R")     # hierarchy_labels() for prompt context (change 1)
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
 MODEL        <- "gpt-4o"
 state_file   <- "data/cache/batch_phase4.rds"
 TOKEN_BUDGET <- 78000   # per-chunk input-token cap, safely under the 90k limit
+ASC_CAP      <- 4       # nearest ascendants shown per concept in the prompt
+DESC_CAP     <- 6       # descendant generation shown per concept in the prompt
 
 SYS_MSG <- paste(
   "You are an expert in SKOS thesaurus alignment. You compare a source",
   "concept against candidate concepts from a target thesaurus and classify",
-  "how each candidate relates to the source. Respond only with JSON.")
+  "how each candidate relates to the source. Apply the stated match-type",
+  "rules strictly. Respond only with JSON.")
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
+# Hierarchy context lines (change 1): "Broader:"/"Narrower:" added only when
+# present. `broader`/`narrower` are pre-joined "; "-separated label strings.
+ctx_lines <- function(broader, narrower, prefix = "") {
+  out <- character(0)
+  if (!is.na(broader)  && nzchar(broader))
+    out <- c(out, paste0(prefix, "Broader: ",  broader))
+  if (!is.na(narrower) && nzchar(narrower))
+    out <- c(out, paste0(prefix, "Narrower: ", narrower))
+  out
+}
+
 build_user_msg <- function(term_pref, term_gloss, cand) {
   lines <- vapply(seq_len(nrow(cand)), function(j) {
     d <- cand$elsst_definition[j]
     d <- if (is.na(d) || !nzchar(d)) "(no definition)" else d
-    sprintf("%d. %s — %s", j, cand$elsst_pref_en[j], d)
+    head <- sprintf("%d. %s — %s", j, cand$elsst_pref_en[j], d)
+    ctx  <- ctx_lines(cand$cand_broader[j], cand$cand_narrower[j], "   ")
+    paste(c(head, ctx), collapse = "\n")
   }, character(1))
+  src_ctx   <- ctx_lines(cand$onto_broader[1], cand$onto_narrower[1])
+  src_block <- if (length(src_ctx)) paste0(paste(src_ctx, collapse = "\n"), "\n") else ""
+  type_defs <- paste(sprintf("- %s: %s", names(MATCH_TYPE_DEFS), MATCH_TYPE_DEFS),
+                      collapse = "\n")
   paste0(
     "SOURCE CONCEPT (OntoPop):\n",
     "Label: ", term_pref, "\n",
-    "Definition: ", if (is.na(term_gloss)) "(none)" else term_gloss, "\n\n",
+    "Definition: ", if (is.na(term_gloss)) "(none)" else term_gloss, "\n",
+    src_block, "\n",
     "CANDIDATE CONCEPTS (ELSST):\n", paste(lines, collapse = "\n"), "\n\n",
+    "The Broader/Narrower lines give each concept's parents and children in ",
+    "its own thesaurus; use them to judge what kind of entity each concept is ",
+    "and the direction of any hierarchy.\n\n",
     "For each candidate, classify its relationship TO THE SOURCE concept as ",
-    "exactly one of: exactMatch, closeMatch, broadMatch, narrowMatch, ",
-    "relatedMatch, none.\n",
-    "- exactMatch: the same concept\n",
-    "- closeMatch: nearly the same; interchangeable in most contexts\n",
-    "- broadMatch: the candidate is broader (more general) than the source\n",
-    "- narrowMatch: the candidate is narrower (more specific) than the source\n",
-    "- relatedMatch: associated, but not equivalence or hierarchy\n",
-    "- none: no meaningful relationship\n\n",
+    "exactly one of: ", paste(names(MATCH_TYPE_DEFS), collapse = ", "), ".\n",
+    type_defs, "\n\n",
+    MATCH_TYPE_RULES, "\n\n",
     "Return JSON {\"results\":[{\"candidate\":1,\"match_type\":\"...\",",
     "\"rationale\":\"one sentence\"}]} with exactly one entry per candidate.")
 }
@@ -78,7 +99,23 @@ request_line <- function(code, user) {
 
 # ── Build chunked state on first run ──────────────────────────────────────────
 if (!file.exists(state_file)) {
+  # Hierarchy context (change 1): join capped Broader/Narrower label strings
+  # for the source term (OntoPop ascendants/children) and each candidate
+  # (ELSST ascendants/narrower_1) from the cached tables onto the shortlist.
+  ontopop <- readRDS("data/cache/ontopop.rds")
+  elsst   <- readRDS("data/cache/elsst.rds")
+  join_ctx <- function(col, n) vapply(col, function(c)
+    paste(hierarchy_labels(c, n), collapse = "; "), character(1))
+  onto_ctx <- tibble(ontopop_id    = ontopop$id,
+                     onto_broader  = join_ctx(ontopop$ascendants, ASC_CAP),
+                     onto_narrower = join_ctx(ontopop$children,   DESC_CAP))
+  elsst_ctx <- tibble(elsst_id      = elsst$id,
+                      cand_broader  = join_ctx(elsst$ascendants, ASC_CAP),
+                      cand_narrower = join_ctx(elsst$narrower_1, DESC_CAP))
+
   candidates <- readRDS("data/candidates_phase3.rds") |>
+    left_join(onto_ctx,  by = "ontopop_id") |>
+    left_join(elsst_ctx, by = "elsst_id") |>
     group_by(ontopop_code) |>
     mutate(candidate = row_number()) |>
     ungroup()
@@ -141,7 +178,7 @@ if (all(done)) {
     arrange(ontopop_code, candidate) |>
     select(ontopop_id, ontopop_code, ontopop_pref_en, ontopop_gloss,
            elsst_id, elsst_uuid, elsst_pref_en, elsst_definition,
-           jw_sim, cos_sim, provenance, match_type, rationale)
+           jw_sim, cos_sim, provenance, phase1_tier, match_type, rationale)
 
   cat("\n=== Phase 4 results ===\n")
   cat("Adjudicated pairs:", nrow(result),

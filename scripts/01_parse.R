@@ -14,6 +14,7 @@ suppressPackageStartupMessages({
 source("R/utils.R")
 source("R/load_elsst.R")
 source("R/load_ontopop.R")
+source("R/hierarchy.R")
 
 dir.create("data/cache", recursive = TRUE, showWarnings = FALSE)
 
@@ -23,6 +24,7 @@ ontopop_path <- "OntoPop_RDF-XML_20260327.owl"
 message("Parsing ELSST from ", elsst_path, " ...")
 t0 <- Sys.time()
 elsst <- load_elsst(elsst_path)
+elsst <- add_elsst_hierarchy(elsst)   # ascendants (broader chain) + narrower_1
 message(sprintf("  %d concepts in %.1fs", nrow(elsst),
                 as.numeric(difftime(Sys.time(), t0, units = "secs"))))
 saveRDS(elsst, "data/cache/elsst.rds")
@@ -30,9 +32,13 @@ saveRDS(elsst, "data/cache/elsst.rds")
 message("Parsing OntoPop from ", ontopop_path, " ...")
 t0 <- Sys.time()
 ontopop <- load_ontopop(ontopop_path)
+ontopop <- add_ontopop_hierarchy(ontopop)   # ascendants (subClassOf chain) + children
 message(sprintf("  %d classes in %.1fs", nrow(ontopop),
                 as.numeric(difftime(Sys.time(), t0, units = "secs"))))
 saveRDS(ontopop, "data/cache/ontopop.rds")
+
+# context columns are list-cols of tibble(id,label); count rows, not cols
+nr <- function(col) vapply(col, nrow, integer(1))
 
 cat("\n=== ELSST ===\n")
 cat("Concepts:                       ", nrow(elsst), "\n")
@@ -41,13 +47,21 @@ cat("With English definition:        ", sum(!is.na(elsst$definition_en)), "\n")
 cat("With >=1 English altLabel:      ", sum(lengths(elsst$alt_en) > 0), "\n")
 cat("Top concepts:                   ", sum(elsst$top_concept), "\n")
 cat("With >=1 broader link:          ", sum(lengths(elsst$broader) > 0), "\n")
+cat("With >=1 ascendant (resolved):  ", sum(nr(elsst$ascendants) > 0), "\n")
+cat("With >=1 narrower_1:            ", sum(nr(elsst$narrower_1) > 0), "\n")
+cat("Max ascendant depth:            ", max(nr(elsst$ascendants)), "\n")
 
 cat("\n=== OntoPop ===\n")
 cat("Classes:                        ", nrow(ontopop), "\n")
-cat("With English prefLabel:         ", sum(!is.na(ontopop$pref_en)), "\n")
+cat("With English label (pref_en):   ", sum(!is.na(ontopop$pref_en)), "\n")
+cat("  from skos:prefLabel:          ", sum(ontopop$label_source == "skos:prefLabel", na.rm = TRUE), "\n")
+cat("  from rdfs:label fallback:     ", sum(ontopop$label_source == "rdfs:label", na.rm = TRUE), "\n")
 cat("With English definedInContext:  ", sum(!is.na(ontopop$definition_en)), "\n")
 cat("With >=1 English altLabel:      ", sum(lengths(ontopop$alt_en) > 0), "\n")
 cat("With >=1 parent class:          ", sum(lengths(ontopop$parents) > 0), "\n")
+cat("With >=1 ascendant (resolved):  ", sum(nr(ontopop$ascendants) > 0), "\n")
+cat("With >=1 child:                 ", sum(nr(ontopop$children) > 0), "\n")
+cat("Max ascendant depth:            ", max(nr(ontopop$ascendants)), "\n")
 cat("Distinct IUSSP sections:        ", dplyr::n_distinct(ontopop$section), "\n")
 
 cat("\nSample ELSST rows:\n")

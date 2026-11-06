@@ -8,7 +8,12 @@
   httr2::request("https://api.openai.com") |>
     httr2::req_url_path_append(path) |>
     httr2::req_auth_bearer_token(key) |>
-    httr2::req_retry(max_tries = 4, backoff = ~ 2 ^ .x) |>
+    httr2::req_retry(
+      max_tries = 6, backoff = ~ 2 ^ .x,
+      # httr2's default only retries 429/503; OpenAI also throws transient
+      # 500/502/504 under load, so retry those too (and connection errors,
+      # which httr2 treats as transient regardless).
+      is_transient = ~ httr2::resp_status(.x) %in% c(429, 500, 502, 503, 504)) |>
     httr2::req_timeout(120)
 }
 

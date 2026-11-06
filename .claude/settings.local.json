@@ -3,7 +3,10 @@
     "allow": [
       "Bash(Rscript --version)",
       "Bash(Rscript:*)",
-      "Bash(grep -o \"position \\\\${vi+1}\" data/review.html)"
+      "Bash(grep -o \"position \\\\${vi+1}\" data/review.html)",
+      "PowerShell(New-Item *)",
+      "Bash(git tag *)",
+      "Bash(git checkout *)"
     ]
   }
 }
