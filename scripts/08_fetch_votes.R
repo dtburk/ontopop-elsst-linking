@@ -8,8 +8,9 @@
 #
 # Output:
 #   data/review_votes.csv    one row per human vote (long format)
-#   data/review_summary.csv  one row per candidate link: the gpt-4o
-#                            assignment plus human vote counts by type
+#   data/review_summary.csv  one row per link (gpt-4o candidates and links
+#                            added by reviewers): the gpt-4o assignment, if any,
+#                            plus human vote counts by type
 
 suppressPackageStartupMessages({ library(dplyr); library(jsonlite) })
 `%||%` <- function(a, b) if (is.null(a)) b else a
@@ -68,6 +69,23 @@ votes_table <- function(shard_docs) {
            created = parse_ts(created), updated = parse_ts(updated))
 }
 
+#' Reviewer-added links (pairs gpt-4o never proposed) from the shards' x maps.
+added_table <- function(shard_docs) {
+  rows <- list()
+  for (d in shard_docs) {
+    x <- doc_fields(d)$x %||% list()
+    for (pk in names(x)) {
+      a <- x[[pk]]
+      if (is.null(a$e)) next
+      rows[[length(rows) + 1]] <- tibble(pair_key = pk, elsst_id = a$e,
+        added_by = a$by %||% NA_character_, added_at = a$c %||% NA_character_)
+    }
+  }
+  if (!length(rows)) return(tibble(pair_key = character(), elsst_id = character(),
+    added_by = character(), added_at = as.POSIXct(character())))
+  bind_rows(rows) |> mutate(added_at = parse_ts(added_at))
+}
+
 reviewers_table <- function(docs) {
   bind_rows(lapply(docs, function(d) {
     f <- doc_fields(d)
@@ -82,31 +100,49 @@ if (sys.nframe() == 0L) {          # run as a script (not when source()d)
   if (!nzchar(cfg$projectId %||% "") || !nzchar(cfg$apiKey %||% ""))
     stop("docs/config.json has no Firebase projectId/apiKey — see REVIEW_SITE.md")
   reviewers <- reviewers_table(fetch_collection(cfg, "reviewers"))
-  votes     <- votes_table(fetch_collection(cfg, "vote_shards"))
+  shards    <- fetch_collection(cfg, "vote_shards")
+  votes     <- votes_table(shards)
+  added     <- added_table(shards)
+
+  # Every link: the gpt-4o candidates plus reviewer-added pairs.
   r4 <- readRDS("data/candidates_phase4.rds") |>
-    select(ontopop_code, ontopop_id, ontopop_pref_en, elsst_uuid, elsst_id,
-           elsst_pref_en, llm_match_type = match_type, llm_rationale = rationale)
+    transmute(pair_key = paste0(ontopop_code, "|", elsst_uuid), link_source = "gpt-4o",
+              ontopop_code, ontopop_id, ontopop_pref_en, elsst_id, elsst_pref_en,
+              llm_match_type = match_type, llm_rationale = rationale)
+  ontopop <- readRDS("data/cache/ontopop.rds")
+  elsst   <- readRDS("data/cache/elsst.rds")
+  added_links <- added |>
+    filter(!pair_key %in% r4$pair_key) |>
+    left_join(reviewers |> select(reviewer_id, added_by_name = reviewer_name),
+              by = c("added_by" = "reviewer_id")) |>
+    mutate(ontopop_code = sub("\\|.*$", "", pair_key), link_source = "reviewer-added") |>
+    left_join(ontopop |> select(ontopop_code = code, ontopop_id = id, ontopop_pref_en = pref_en),
+              by = "ontopop_code") |>
+    left_join(elsst |> select(elsst_id = id, elsst_pref_en = pref_en), by = "elsst_id")
+  links <- bind_rows(r4, added_links |> select(-added_by))
 
   long <- votes |>
     left_join(reviewers, by = "reviewer_id") |>
-    left_join(r4, by = c("ontopop_code", "elsst_uuid")) |>
-    select(ontopop_code, ontopop_pref_en, elsst_pref_en, llm_match_type,
+    left_join(links |> select(-ontopop_code), by = "pair_key") |>
+    select(ontopop_code, ontopop_pref_en, elsst_pref_en, link_source, llm_match_type,
            reviewer_name, reviewer_affiliation, match_type, note, created, updated,
            ontopop_id, elsst_id, reviewer_id) |>
     arrange(ontopop_code, elsst_pref_en, created)
-  orphans <- sum(is.na(long$ontopop_id))
-  if (orphans) warning(orphans, " vote(s) refer to links no longer in candidates_phase4.rds")
+  orphans <- sum(is.na(long$link_source))
+  if (orphans) warning(orphans, " vote(s) refer to links that are neither in ",
+                       "candidates_phase4.rds nor reviewer-added")
 
-  summary <- r4 |>
-    left_join(votes |> count(ontopop_code, elsst_uuid, match_type) |>
+  summary <- links |>
+    left_join(votes |> count(pair_key, match_type) |>
                 tidyr::pivot_wider(names_from = match_type, values_from = n,
                                    names_prefix = "votes_", values_fill = 0),
-              by = c("ontopop_code", "elsst_uuid")) |>
+              by = "pair_key") |>
     mutate(across(starts_with("votes_"), \(x) coalesce(x, 0L)))
   summary$n_reviewers <- rowSums(select(summary, starts_with("votes_")))
 
   write.csv(long,    "data/review_votes.csv",   row.names = FALSE, na = "")
   write.csv(summary, "data/review_summary.csv", row.names = FALSE, na = "")
-  cat(sprintf("%d reviewers, %d votes on %d links (of %d). Wrote data/review_votes.csv and data/review_summary.csv\n",
-              nrow(reviewers), nrow(votes), n_distinct(votes$pair_key), nrow(r4)))
+  cat(sprintf("%d reviewers, %d votes on %d links (%d gpt-4o candidates + %d reviewer-added). Wrote data/review_votes.csv and data/review_summary.csv
+",
+              nrow(reviewers), nrow(votes), n_distinct(votes$pair_key), nrow(r4), nrow(added_links)))
 }

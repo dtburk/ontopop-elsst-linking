@@ -6,7 +6,9 @@
 # this script only produces the read-only data the app displays:
 #
 #   docs/review.json  — one entry per OntoPop term (with its candidates and
-#                       gpt-4o assignment/rationale), ELSST hierarchy context,
+#                       gpt-4o assignment/rationale), every ELSST concept
+#                       (label, definition, alt labels, hierarchy context — so
+#                       reviewers can also add links gpt-4o didn't propose),
 #                       cross-references, and the match-type criteria HTML.
 #
 # Contents carried over from iteration 2:
@@ -49,19 +51,30 @@ hier_codes <- function(cell) {
 onto_asc <- setNames(lapply(ontopop$ascendants, hier_codes), ontopop$id)
 onto_chl <- setNames(lapply(ontopop$children,   hier_codes), ontopop$id)
 
-# ELSST candidate hierarchy as plain label vectors (display context), keyed by
-# ELSST id and looked up in the page — avoids duplicating it across the many
-# terms each ELSST concept is a candidate for. Drop empties to save space.
+# ELSST concepts. Every concept (not just Phase 4 candidates) is shipped so
+# reviewers can add links gpt-4o never proposed. Label/definition/alt labels
+# live here once, keyed by ELSST id, instead of being repeated on each of the
+# ~19k candidate rows; the app looks them up by id.
+ELSST <- setNames(lapply(seq_len(nrow(elsst)), function(i) {
+  alt <- elsst$alt_en[[i]]
+  alt <- if (is.null(alt)) character(0) else alt[!is.na(alt) & nzchar(alt)]
+  x <- list(l = elsst$pref_en[i])
+  if (!is.na(elsst$definition_en[i])) x$d <- elsst$definition_en[i]
+  if (length(alt)) x$a <- as.list(alt)
+  x
+}), elsst$id)
+
+# ELSST hierarchy as plain label vectors (display context), keyed by ELSST id.
+# Drop empties to save space.
 labels_of <- function(cell)
   if (is.null(cell) || !nrow(cell)) character(0) else cell$label[!is.na(cell$label)]
-el_asc  <- setNames(elsst$ascendants, elsst$id)
-el_narr <- setNames(elsst$narrower_1, elsst$id)
-ELSST_CTX <- setNames(lapply(sort(unique(r4$elsst_id)), function(eid)
-  list(asc  = as.list(labels_of(el_asc[[eid]])),
-       narr = as.list(labels_of(el_narr[[eid]])))),
-  sort(unique(r4$elsst_id)))
+ELSST_CTX <- setNames(lapply(seq_len(nrow(elsst)), function(i)
+  list(asc  = as.list(labels_of(elsst$ascendants[[i]])),
+       narr = as.list(labels_of(elsst$narrower_1[[i]])))),
+  elsst$id)
 ELSST_CTX <- ELSST_CTX[vapply(ELSST_CTX,
   function(x) length(x$asc) + length(x$narr) > 0, logical(1))]
+stopifnot(all(r4$elsst_id %in% names(ELSST)))
 
 # ── Cross-references (change 4) ───────────────────────────────────────────────
 # For each ELSST concept, every OntoPop term gpt-4o matched it to (non-none),
@@ -104,9 +117,7 @@ term_of <- function(cd) {
     asc     = onto_asc[[id]] %||% list(),
     chl     = onto_chl[[id]] %||% list(),
     candidates = lapply(seq_len(nrow(tr)), function(i) list(
-      elsst_id    = tr$elsst_id[i],
-      elsst_label = tr$elsst_pref_en[i],
-      elsst_def   = tr$elsst_definition[i],
+      elsst_id    = tr$elsst_id[i],          # label/definition: see ELSST
       match_type  = tr$match_type[i],
       rationale   = tr$rationale[i],
       jw_sim      = tr$jw_sim[i],
@@ -118,8 +129,8 @@ terms <- lapply(order_codes, term_of)
 
 n_cands    <- nrow(r4)
 n_proposed <- sum(!is.na(r4$match_type) & r4$match_type != "none")
-cat(sprintf("Building %d terms, %d links (%d gpt-4o proposals); %d ELSST ctx entries, %d xref entries\n",
-            length(terms), n_cands, n_proposed, length(ELSST_CTX), length(XREF)))
+cat(sprintf("Building %d terms, %d links (%d gpt-4o proposals); %d ELSST concepts, %d ctx entries, %d xref entries\n",
+            length(terms), n_cands, n_proposed, length(ELSST), length(ELSST_CTX), length(XREF)))
 
 # ── Match-type criteria HTML (change 3, from the shared constants) ────────────
 esc_html <- function(s) {
@@ -145,6 +156,7 @@ payload <- list(
               type_defs  = as.list(MATCH_TYPE_DEFS)),
   rules_html = paste0(defs_html, rules_html),
   terms      = terms,
+  elsst      = ELSST,
   elsst_ctx  = ELSST_CTX,
   xref       = XREF)
 

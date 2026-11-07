@@ -10,11 +10,14 @@
 //
 // Data model (both stores):
 //   reviewers/{rid}      { name, affiliation, created }
-//   vote_shards/s{NNN}   { v: { "<code>|<elsstUuid>": { <rid>: {t, n, c, u} } } }
+//   vote_shards/s{NNN}   { v: { "<code>|<elsstUuid>": { <rid>: {t, n, c, u} } },
+//                          x: { "<code>|<elsstUuid>": {e, by, c} } }
 // One shard document per OntoPop section (the NNN in code NNN-M, ~210 docs),
 // so a page load costs ~210 Firestore reads however many votes exist, well
-// inside the free tier. t = match type ('none' = reject), n = note,
-// c / u = created / updated time.
+// inside the free tier. v holds votes: t = match type ('none' = reject),
+// n = note, c / u = created / updated time. x holds links added by reviewers
+// (pairs gpt-4o never proposed): e = ELSST id, by = reviewer id, c = created.
+// An added link is voted on exactly like a gpt-4o candidate.
 
 const FIREBASE_VERSION = '10.12.2';
 const PREFS_KEY = 'elsst_review_prefs_v2';
@@ -28,14 +31,18 @@ const esc = s => (s == null ? '' : String(s)).replace(/[&<>"']/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 // ── Static data ─────────────────────────────────────────────────────────────
-let DATA = [], CTX = {}, XREF = {}, META = {};
+let DATA = [], CTX = {}, XREF = {}, META = {}, ELSST = {};
 const CODE_INDEX = {}, CHILDREN = {}, PARENTS = {};
+const ELSST_BY_UUID = {};    // uuid -> ELSST id
+const CAND = {};             // pk -> gpt-4o candidate object (with .code)
 let ROOTS = [];
 
 // ── Shared (store) state ────────────────────────────────────────────────────
 let STORE = null;
 let REVIEWERS = {};          // rid -> {name, affiliation, created}
-let SHARDS = {};             // sid -> { pk -> { rid -> vote } }
+let SHARDS = {};             // sid -> { v: {pk -> {rid -> vote}}, x: {pk -> added link} }
+let ADDED_BY_CODE = {};      // code -> [added-link candidate objects]
+let ADDED_BY_EID = {};       // ELSST id -> [{code, label}] (reviewer-added links)
 let reviewersLoaded = false;
 let SYNC = { state: 'connecting', msg: 'Connecting…' };
 
@@ -48,6 +55,8 @@ let cur = null;                       // code of the term on screen
 const DRAFTS = {};                    // pk -> {t, n, editing}: unsaved form state
 const STICKY = new Set();             // pks voted on this visit: keep visible
 let coldOpen = false;                 // "gpt-4o rejected" section expanded?
+let view = 'review';                  // 'review' | 'log'
+let scrollToPk = null;                // card to scroll to after the next show()
 let TSTATS = {}, TOTALS = {}, MATCH = {}, SUB = {};
 
 function loadPrefs(){
@@ -65,7 +74,7 @@ const uuidOf = eid  => eid.slice(eid.lastIndexOf('/') + 1);
 const pkOf   = (code, eid) => code + '|' + uuidOf(eid);
 
 function humanVotes(code, eid){
-  const m = SHARDS[sidOf(code)]?.[pkOf(code, eid)];
+  const m = SHARDS[sidOf(code)]?.v?.[pkOf(code, eid)];
   if (!m) return [];
   return Object.entries(m)
     .filter(([, v]) => v && v.t)
@@ -119,13 +128,16 @@ async function makeFirebaseStore(fbConfig, onChange){
   fs.onSnapshot(fs.collection(db, 'vote_shards'), { includeMetadataChanges: true }, snap => {
     const out = {};
     snap.forEach(d => {
-      const v = d.data({ serverTimestamps: 'estimate' }).v || {};
-      const shard = {};
-      for (const [pk, byRid] of Object.entries(v)) {
-        shard[pk] = {};
+      const raw = d.data({ serverTimestamps: 'estimate' });
+      const shard = { v: {}, x: {} };
+      for (const [pk, byRid] of Object.entries(raw.v || {})) {
+        shard.v[pk] = {};
         for (const [rid, x] of Object.entries(byRid || {})) {
-          if (x && x.t) shard[pk][rid] = { t: x.t, n: x.n || '', c: tsMillis(x.c), u: tsMillis(x.u) };
+          if (x && x.t) shard.v[pk][rid] = { t: x.t, n: x.n || '', c: tsMillis(x.c), u: tsMillis(x.u) };
         }
+      }
+      for (const [pk, a] of Object.entries(raw.x || {})) {
+        if (a && a.e) shard.x[pk] = { e: a.e, by: a.by, c: tsMillis(a.c) };
       }
       out[d.id] = shard;
     });
@@ -162,14 +174,33 @@ async function makeFirebaseStore(fbConfig, onChange){
       return fs.setDoc(shardRef(code), { v: { [pkOf(code, eid)]: { [rid]: fs.deleteField() } } }, { merge: true })
         .catch(report('delete your vote'));
     },
+    // A reviewer-added link and its proposer's vote, in one atomic write.
+    addLink(code, eid, rid, t, n){
+      const pk = pkOf(code, eid), now = fs.serverTimestamp();
+      return fs.setDoc(shardRef(code), {
+        x: { [pk]: { e: eid, by: rid, c: now } },
+        v: { [pk]: { [rid]: { t, n, c: now, u: now } } },
+      }, { merge: true }).catch(report('add the link'));
+    },
+    removeLink(code, eid){
+      const pk = pkOf(code, eid);
+      return fs.setDoc(shardRef(code), { x: { [pk]: fs.deleteField() }, v: { [pk]: fs.deleteField() } }, { merge: true })
+        .catch(report('remove the link'));
+    },
   };
 }
 
 function makeLocalStore(onChange){
   const read = () => {
-    try { return JSON.parse(localStorage.getItem(LOCAL_DB_KEY)) || { reviewers: {}, shards: {} }; }
-    catch { return { reviewers: {}, shards: {} }; }
+    let db;
+    try { db = JSON.parse(localStorage.getItem(LOCAL_DB_KEY)) || { reviewers: {}, shards: {} }; }
+    catch { db = { reviewers: {}, shards: {} }; }
+    // Earlier demo data stored votes directly as shard[pk]; move them under v.
+    for (const [sid, sh] of Object.entries(db.shards))
+      if (!('v' in sh) && !('x' in sh)) db.shards[sid] = { v: sh, x: {} };
+    return db;
   };
+  const shardOf = code => db.shards[sidOf(code)] ??= { v: {}, x: {} };
   let db = read();
   const persist = () => {
     try { localStorage.setItem(LOCAL_DB_KEY, JSON.stringify(db)); }
@@ -190,15 +221,25 @@ function makeLocalStore(onChange){
       persist(); emit(); return id;
     },
     setVote(code, eid, rid, t, n, isNew){
-      const sid = sidOf(code), pk = pkOf(code, eid), now = Date.now();
-      const shard = db.shards[sid] ??= {};
-      const byRid = shard[pk] ??= {};
+      const pk = pkOf(code, eid), now = Date.now();
+      const byRid = shardOf(code).v[pk] ??= {};
       byRid[rid] = { t, n, c: isNew || !byRid[rid] ? now : byRid[rid].c, u: now };
       persist(); emit();
     },
     deleteVote(code, eid, rid){
-      const byRid = db.shards[sidOf(code)]?.[pkOf(code, eid)];
+      const byRid = db.shards[sidOf(code)]?.v[pkOf(code, eid)];
       if (byRid) { delete byRid[rid]; persist(); emit(); }
+    },
+    addLink(code, eid, rid, t, n){
+      const pk = pkOf(code, eid), now = Date.now(), sh = shardOf(code);
+      sh.x[pk] = { e: eid, by: rid, c: now };
+      sh.v[pk] = { ...(sh.v[pk] || {}), [rid]: { t, n, c: now, u: now } };
+      persist(); emit();
+    },
+    removeLink(code, eid){
+      const pk = pkOf(code, eid), sh = shardOf(code);
+      delete sh.x[pk]; delete sh.v[pk];
+      persist(); emit();
     },
   };
 }
@@ -216,6 +257,7 @@ function onStoreChange(ch){
   if (ch.sync) SYNC = ch.sync;
   if ($('#whoDlg').open) fillWhoSelect();
   if (DATA.length) renderAll();
+  if (LD && $('#linkDlg').open) { renderLinkResults(); renderLinkPick(); }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -223,7 +265,26 @@ function onStoreChange(ch){
 // ════════════════════════════════════════════════════════════════════════════
 const isProposal = c => c.match_type && c.match_type !== 'none';
 
+// Reviewer-added links, as candidate-like objects (`added` marks them). Pairs
+// that are also gpt-4o candidates (e.g. after a data rebuild) are skipped:
+// their votes already show on the candidate card.
+function computeAdded(){
+  ADDED_BY_CODE = {}; ADDED_BY_EID = {};
+  for (const sh of Object.values(SHARDS)) {
+    for (const [pk, a] of Object.entries(sh.x || {})) {
+      const code = pk.slice(0, pk.indexOf('|'));
+      if (CAND[pk] || !(code in CODE_INDEX) || !ELSST[a.e]) continue;
+      const e = ELSST[a.e];
+      (ADDED_BY_CODE[code] ??= []).push({ elsst_id: a.e, elsst_label: e.l, elsst_def: e.d || null,
+                                          match_type: null, added: { by: a.by, c: a.c } });
+      (ADDED_BY_EID[a.e] ??= []).push({ code, label: DATA[CODE_INDEX[code]].label });
+    }
+  }
+  for (const list of Object.values(ADDED_BY_CODE)) list.sort((a, b) => (a.added.c || 0) - (b.added.c || 0));
+}
+
 function computeStats(){
+  computeAdded();
   const rid = me();
   let all = 0, allRev = 0, prop = 0, propRev = 0;
   TSTATS = {};
@@ -237,10 +298,12 @@ function computeStats(){
         if (!rid || !hv.some(v => v.rid === rid)) s.needMine++;
       }
     }
+    s.added = (ADDED_BY_CODE[t.code] || []).length;
     TSTATS[t.code] = s;
     all += s.total; allRev += s.rev; prop += s.prop; propRev += s.propRev;
   }
-  TOTALS = { all, allRev, prop, propRev };
+  const added = Object.values(ADDED_BY_CODE).reduce((a, l) => a + l.length, 0);
+  TOTALS = { all, allRev, prop, propRev, added };
 }
 
 const FILTERS = [
@@ -249,7 +312,8 @@ const FILTERS = [
   ['labelmatch', 'Phase 1 label match',               t => t.candidates.some(c => (c.provenance || '').includes('phase1'))],
   ['unreviewed', 'Unreviewed gpt-4o proposals',       t => TSTATS[t.code].propRev < TSTATS[t.code].prop],
   ['mine',       'Proposals I haven’t voted on',      t => TSTATS[t.code].needMine > 0],
-  ['humanvotes', 'Has human votes',                   t => TSTATS[t.code].rev > 0],
+  ['humanvotes', 'Has human votes',                   t => TSTATS[t.code].rev > 0 || TSTATS[t.code].added > 0],
+  ['added',      'Has reviewer-added links',          t => TSTATS[t.code].added > 0],
 ];
 const filterFn = key => (FILTERS.find(f => f[0] === key) || FILTERS[0])[2];
 
@@ -287,18 +351,24 @@ function renderAll(opts = {}){
   computeStats();
   computeVisibility();
   renderHeader();
+  if (view === 'log') { renderLog(); return; }
+  $('.layout').hidden = false;
+  $('#logView').hidden = true;
   renderTree(opts.scrollTree);
   renderMain();
 }
 
 function renderHeader(){
-  const { all, allRev, prop, propRev } = TOTALS;
+  const { all, allRev, prop, propRev, added } = TOTALS;
   const pct = all ? 100 * allRev / all : 0;
   $('#prog').style.width = pct + '%';
   $('#progtxt').textContent =
     `${allRev.toLocaleString()} / ${all.toLocaleString()} links reviewed (${
       pct > 0 && pct < 0.1 ? '<0.1' : pct < 10 ? pct.toFixed(1).replace(/\.0$/, '') : Math.round(pct)}%)`;
-  $('#progsub').textContent = `gpt-4o proposals: ${propRev.toLocaleString()} / ${prop.toLocaleString()}`;
+  $('#progsub').textContent = `gpt-4o proposals: ${propRev.toLocaleString()} / ${prop.toLocaleString()}` +
+    (added ? ` · +${added.toLocaleString()} reviewer-added` : '');
+  $('#logBtn').textContent = view === 'log' ? '← Back to review' : 'Human review log';
+  document.body.classList.toggle('logmode', view === 'log');
 
   const sync = $('#sync');
   sync.className = 'sync ' + SYNC.state;
@@ -450,21 +520,38 @@ function card(t, c){
         xref.length > XREF_SHOW
           ? ` <details class="xmore"><summary>show ${xref.length - XREF_SHOW} more</summary>${xref.slice(XREF_SHOW).map(xItem).join(' &nbsp; ')}</details>`
           : ''}</div>` : '';
+  const hx = (ADDED_BY_EID[c.elsst_id] || []).filter(p => p.code !== t.code);
+  const hxHtml = hx.length
+    ? `<div class="partners human">✚ Reviewers also linked this ELSST concept to: ${
+        hx.map(p => `<a class="plink" data-code="${esc(p.code)}">${esc(p.label)}</a>`).join(', ')}</div>` : '';
 
-  const votes = [voteRow({ t: c.match_type || 'none', n: c.rationale }, { model: true })]
+  const votes = (c.added ? [] : [voteRow({ t: c.match_type || 'none', n: c.rationale }, { model: true })])
     .concat(hv.map(v => voteRow(v, { mine: v.rid === rid })));
 
-  return `<div class="cand${hrej ? ' hrej' : ''}" data-pk="${esc(pk)}" data-eid="${esc(c.elsst_id)}">
+  let meta;
+  if (c.added) {
+    const by = REVIEWERS[c.added.by];
+    // The proposer may withdraw the link while nobody else has voted on it.
+    const canRemove = rid && c.added.by === rid && hv.every(v => v.rid === rid);
+    meta = `<span class="badge b-added">reviewer-added link</span> added by ${esc(by ? by.name : 'unknown reviewer')}` +
+      `${c.added.c ? ' · ' + fmtTime(c.added.c) : ''}` +
+      (canRemove ? ` &nbsp;<button class="linkbtn danger" data-act="removelink" title="Remove this link and its votes (possible while no one else has voted on it)">remove link</button>` : '');
+  } else {
+    meta = `JW ${c.jw_sim == null ? '—' : c.jw_sim.toFixed(3)}
+      &nbsp;·&nbsp; cosine ${c.cos_sim == null ? '—' : c.cos_sim.toFixed(3)}
+      &nbsp;·&nbsp; ${esc(c.provenance)}${p1badge}`;
+  }
+
+  return `<div class="cand${hrej ? ' hrej' : ''}${c.added ? ' added' : ''}" data-pk="${esc(pk)}" data-eid="${esc(c.elsst_id)}">
     <div class="cand-head">
       <h3><a href="${esc(c.elsst_id)}" target="_blank" rel="noopener">${esc(c.elsst_label)} ↗</a></h3>
       ${rbadge}
     </div>
-    <div class="meta">JW ${c.jw_sim == null ? '—' : c.jw_sim.toFixed(3)}
-      &nbsp;·&nbsp; cosine ${c.cos_sim == null ? '—' : c.cos_sim.toFixed(3)}
-      &nbsp;·&nbsp; ${esc(c.provenance)}${p1badge}</div>
-    ${hier}${xrefHtml}${defTxt}
+    <div class="meta">${meta}</div>
+    ${hier}${xrefHtml}${hxHtml}${defTxt}
     <div class="votes"><span class="label">Votes</span>${votes.join('')}</div>
     ${voteForm(pk, mine)}
+    <div class="cand-foot"><button class="linkbtn" data-act="linkonto" title="Propose a link between this ELSST concept and a different OntoPop class">✚ Link this ELSST concept to another OntoPop class</button></div>
   </div>`;
 }
 
@@ -487,9 +574,14 @@ function renderMain(){
     const pk = pkOf(t.code, c.elsst_id);
     return { c, pk, hidden: linkHidden(pk, humanVotes(t.code, c.elsst_id)) };
   });
+  for (const c of ADDED_BY_CODE[t.code] || []) {
+    const pk = pkOf(t.code, c.elsst_id);
+    items.push({ c, pk, hidden: linkHidden(pk, humanVotes(t.code, c.elsst_id)) });
+  }
   const shown = items.filter(x => !x.hidden);
-  const hot  = shown.filter(x => isProposal(x.c));
-  const cold = shown.filter(x => !isProposal(x.c));
+  const added = shown.filter(x => x.c.added);
+  const hot  = shown.filter(x => !x.c.added && isProposal(x.c));
+  const cold = shown.filter(x => !x.c.added && !isProposal(x.c));
   const nHidden = items.length - shown.length;
 
   const hlink = (list, sep) => list.map(p =>
@@ -514,9 +606,12 @@ function renderMain(){
         <div class="context">${esc(t.context)}</div></details>
       ${ontoHier}
       <div class="termstat">${s.total} candidate links · ${s.rev} reviewed by at least one human ·
-        ${s.propRev} of ${s.prop} gpt-4o proposals reviewed</div>
+        ${s.propRev} of ${s.prop} gpt-4o proposals reviewed${s.added ? ` · ${s.added} added by reviewers` : ''}</div>
+      <div class="term-actions"><button data-act="linkelsst" title="Propose a link to an ELSST concept that gpt-4o did not suggest">✚ Add a link to an ELSST concept</button></div>
     </div>
     ${nHidden ? `<div class="hidden-note">${nHidden} link${nHidden > 1 ? 's' : ''} hidden by your view options (top right).</div>` : ''}
+    ${added.length ? `<div class="group-label">Links added by reviewers</div>${added.map(x => card(t, x.c)).join('')}
+      ${hot.length ? '<div class="group-label">Proposed by gpt-4o</div>' : ''}` : ''}
     ${hot.length ? hot.map(x => card(t, x.c)).join('')
       : nProp ? '' : '<div class="cand empty">gpt-4o rated every candidate “none”. Check the rejected list below.</div>'}
     ${cold.length ? `<details class="cold"${coldOpen ? ' open' : ''}><summary>Show ${cold.length} candidate${cold.length > 1 ? 's' : ''} gpt-4o rejected (“none”)</summary>
@@ -532,6 +627,7 @@ function renderMain(){
 // Interaction
 // ════════════════════════════════════════════════════════════════════════════
 function toast(msg, isErr = false){
+  document.querySelectorAll('.toast').forEach(t => t.remove());   // newest wins
   const el = document.createElement('div');
   el.className = 'toast' + (isErr ? ' err' : '');
   el.textContent = msg;
@@ -551,19 +647,32 @@ function show(code, { scrollTop = true } = {}){
   if (!(code in CODE_INDEX)) return;
   if (code !== cur) { STICKY.clear(); coldOpen = false; }
   cur = code;
+  view = 'review';
   prefs.lastCode = code;
   computeStats(); computeVisibility();
   if (!SUB[code]) { prefs.filter = 'all'; }   // off-filter jump (search, link)
   reveal(code);
   savePrefs();
+  // Jumping to a specific link card (from the log or the add-link dialog):
+  // make sure it is visible, even if gpt-4o rejected it or it is filtered.
+  const pk = scrollToPk; scrollToPk = null;
+  if (pk) { STICKY.add(pk); if (CAND[pk] && !isProposal(CAND[pk])) coldOpen = true; }
   renderAll({ scrollTree: true });
-  if (scrollTop) window.scrollTo(0, 0);
+  const el = pk && $('#wrap').querySelector(`.cand[data-pk="${CSS.escape(pk)}"]`);
+  if (el) { el.scrollIntoView({ block: 'center' }); el.classList.add('flash'); }
+  else if (scrollTop) window.scrollTo(0, 0);
 }
-function go(code){
+function go(code, pk = null){
+  scrollToPk = pk;
   if (location.hash.slice(1) === code) show(code);
   else location.hash = code;                  // → hashchange → show()
 }
-window.addEventListener('hashchange', () => show(decodeURIComponent(location.hash.slice(1))));
+function route(){
+  const h = decodeURIComponent(location.hash.slice(1));
+  if (h === 'log') { view = 'log'; renderAll(); window.scrollTo(0, 0); }
+  else show(h in CODE_INDEX ? h : (cur || (prefs.lastCode in CODE_INDEX ? prefs.lastCode : ROOTS[0])));
+}
+window.addEventListener('hashchange', route);
 
 // ── Tree clicks ─────────────────────────────────────────────────────────────
 $('#tree').addEventListener('click', e => {
@@ -597,7 +706,9 @@ $('#hideRejected').onchange = e => { prefs.hideRejected = e.target.checked; save
 // ── Voting ──────────────────────────────────────────────────────────────────
 function candOf(cardEl){
   const t = DATA[CODE_INDEX[cur]];
-  const c = t.candidates.find(x => x.elsst_id === cardEl.dataset.eid);
+  const eid = cardEl.dataset.eid;
+  const c = t.candidates.find(x => x.elsst_id === eid)
+         || (ADDED_BY_CODE[t.code] || []).find(x => x.elsst_id === eid);
   const rid = me();
   const mine = rid ? humanVotes(t.code, c.elsst_id).find(v => v.rid === rid) : null;
   return { t, c, pk: cardEl.dataset.pk, rid, mine };
@@ -622,8 +733,23 @@ $('#wrap').addEventListener('click', e => {
   const btn = e.target.closest('[data-act]'); if (!btn) return;
   const act = btn.dataset.act;
   if (act === 'signin') { openWho(); return; }
+  if (act === 'linkelsst') { openLink({ mode: 'elsst', code: cur }); return; }
   const cardEl = btn.closest('.cand'); if (!cardEl) return;
   const { t, c, pk, rid, mine } = candOf(cardEl);
+  if (!c) return;
+  if (act === 'linkonto') { openLink({ mode: 'onto', eid: c.elsst_id }); return; }
+  if (act === 'removelink') {
+    if (btn.dataset.armed) {
+      delete DRAFTS[pk];
+      STORE.removeLink(t.code, c.elsst_id);
+      toast('Link removed.');
+      renderAll();
+    } else {
+      btn.dataset.armed = '1'; btn.textContent = 'confirm remove?';
+      setTimeout(() => { if (btn.isConnected) { delete btn.dataset.armed; btn.textContent = 'remove link'; } }, 4000);
+    }
+    return;
+  }
 
   if (act === 'pick') {
     const ta = cardEl.querySelector('.vform textarea');
@@ -809,6 +935,340 @@ document.addEventListener('keydown', e => {
   if (e.key === '/') { e.preventDefault(); searchEl.focus(); }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// Add-link dialog: propose an OntoPop ↔ ELSST link gpt-4o didn't suggest.
+//   mode 'elsst': from an OntoPop term → pick an ELSST concept
+//   mode 'onto' : from an ELSST concept card → pick another OntoPop class
+// The new link goes into the OntoPop term's shard together with the
+// proposer's vote; other reviewers then vote on it like any candidate.
+// ════════════════════════════════════════════════════════════════════════════
+const LINK_TYPES = TYPES.filter(t => t !== 'none');
+let ELSST_INDEX = [];
+let LD = null;   // dialog state: {mode, code, eid, target, t, results}
+
+function buildElsstIndex(){
+  ELSST_INDEX = Object.entries(ELSST).map(([id, e]) => ({
+    id, l_lc: (e.l || '').toLowerCase(), a: e.a || [],
+    a_lc: (e.a || []).map(s => s.toLowerCase()), d_lc: (e.d || '').toLowerCase() }));
+}
+function searchElsst(q){
+  q = q.trim().toLowerCase();
+  if (q.length < 2) return [];
+  const out = [];
+  for (const e of ELSST_INDEX) {
+    let score = 0, hint = '';
+    if (e.l_lc === q) score = 100;
+    else if (e.l_lc.startsWith(q)) score = 90;
+    else if (e.l_lc.includes(q)) score = 80;
+    else {
+      const k = e.a_lc.findIndex(a => a.includes(q));
+      if (k >= 0) { score = e.a_lc[k] === q ? 85 : 60; hint = 'also called: ' + e.a[k]; }
+      else if (e.d_lc.includes(q)) { score = 20; hint = 'in definition'; }
+    }
+    if (score) out.push({ id: e.id, score, hint });
+  }
+  out.sort((a, b) => b.score - a.score || ELSST[a.id].l.localeCompare(ELSST[b.id].l));
+  return out.slice(0, 40);
+}
+function searchOnto(q){
+  q = q.trim().toLowerCase();
+  if (!q) return [];
+  const codeOnly = /^\d+(-\w*)?$/.test(q);
+  const out = [];
+  for (const e of INDEX) {
+    let score = 0, hint = '';
+    if (codeOnly) { if (e.code_lc === q) score = 100; else if (e.code_lc.startsWith(q)) score = 90; }
+    else if (e.label_lc === q) score = 100;
+    else if (e.label_lc.startsWith(q)) score = 90;
+    else if (e.label_lc.includes(q)) score = 80;
+    else if (e.gloss_lc.includes(q)) { score = 40; hint = 'in gloss'; }
+    if (score) out.push({ code: DATA[e.i].code, score, hint });
+  }
+  out.sort((a, b) => b.score - a.score || CODE_INDEX[a.code] - CODE_INDEX[b.code]);
+  return out.slice(0, 40);
+}
+// Is (code, eid) already a link? → description, or null.
+function existingLink(code, eid){
+  const pk = pkOf(code, eid);
+  const c = CAND[pk];
+  if (c) return isProposal(c) ? `already a gpt-4o candidate (gpt-4o: ${c.match_type})`
+                              : 'already a gpt-4o candidate (gpt-4o rated it “none”)';
+  if (SHARDS[sidOf(code)]?.x?.[pk]) return 'already added by a reviewer';
+  return null;
+}
+function relSentence(t, ontoLabel, elsstLabel){
+  const O = `<b>OntoPop “${esc(ontoLabel)}”</b>`, E = `<b>ELSST “${esc(elsstLabel)}”</b>`;
+  return {
+    exactMatch:   `${E} is the same concept as ${O}.`,
+    closeMatch:   `${E} is nearly the same concept as ${O} (interchangeable in most contexts).`,
+    broadMatch:   `${E} is broader than ${O}: ${O} is a type, part/element, or instance of it.`,
+    narrowMatch:  `${E} is narrower than ${O}: it is a type, part/element, or instance of ${O}.`,
+    relatedMatch: `${E} is related to ${O}, but neither equivalent nor hierarchical.`,
+  }[t] || '';
+}
+const ldPair = () => LD.mode === 'elsst' ? { code: LD.code, eid: LD.target } : { code: LD.target, eid: LD.eid };
+
+function openLink(opts){
+  if (!me()) { openWho(); toast('Choose a reviewer profile first.'); return; }
+  LD = { ...opts, target: null, t: null, results: [] };
+  const fromLabel = LD.mode === 'elsst' ? DATA[CODE_INDEX[LD.code]].label : ELSST[LD.eid].l;
+  $('#ldTitle').textContent = LD.mode === 'elsst'
+    ? `Add a link from OntoPop “${fromLabel}” to an ELSST concept`
+    : `Link ELSST “${fromLabel}” to another OntoPop class`;
+  $('#ldSub').textContent = LD.mode === 'elsst'
+    ? 'Search ELSST for a concept that gpt-4o did not suggest. The new link appears on this class’s page with your vote, and other reviewers can vote on it.'
+    : 'Search OntoPop for the class to link to. The new link appears on that class’s page with your vote, and other reviewers can vote on it.';
+  $('#ldSearch').placeholder = LD.mode === 'elsst' ? 'Search ELSST concepts (label, alternative label, definition)…' : 'Search OntoPop classes (label, code, gloss)…';
+  $('#ldSearch').value = '';
+  $('#ldNote').value = '';
+  renderLinkResults();
+  renderLinkPick();
+  $('#linkDlg').showModal();
+  $('#ldSearch').focus();
+}
+function renderLinkResults(){
+  const box = $('#ldResults'), q = $('#ldSearch').value;
+  LD.results = LD.mode === 'elsst' ? searchElsst(q) : searchOnto(q);
+  if (!q.trim()) { box.innerHTML = ''; return; }
+  if (!LD.results.length) { box.innerHTML = '<div class="ld-empty">No matches.</div>'; return; }
+  box.innerHTML = LD.results.map(r => {
+    let label, sub, path, id;
+    if (LD.mode === 'elsst') {
+      id = r.id; const e = ELSST[id];
+      label = hl(e.l, q.trim()); sub = e.d ? esc(e.d.slice(0, 140)) + (e.d.length > 140 ? '…' : '') : '';
+      path = (CTX[id]?.asc || []).slice(0, 3).map(esc).join(' › ');
+    } else {
+      id = r.code; const t = DATA[CODE_INDEX[id]];
+      label = hl(t.label, q.trim()) + ` <span class="hint">${esc(id)}</span>`;
+      sub = t.gloss ? esc(t.gloss.slice(0, 140)) + (t.gloss.length > 140 ? '…' : '') : '';
+      path = (t.asc || []).slice(0, 3).map(p => esc(p.label)).join(' › ');
+    }
+    const pair = LD.mode === 'elsst' ? [LD.code, id] : [id, LD.eid];
+    const ex = existingLink(...pair);
+    return `<div class="ld-res${id === LD.target ? ' sel' : ''}" data-id="${esc(id)}">
+      <div>${label}${ex ? ' <span class="ld-tag">linked</span>' : ''}</div>
+      ${path ? `<div class="hint">in: ${path}</div>` : ''}
+      ${r.hint ? `<div class="hint">${esc(r.hint)}</div>` : ''}
+      ${sub ? `<div class="ld-sub">${sub}</div>` : ''}</div>`;
+  }).join('');
+}
+function renderLinkPick(){
+  const box = $('#ldPick');
+  if (!LD.target) { box.hidden = true; $('#ldAdd').disabled = true; return; }
+  box.hidden = false;
+  const { code, eid } = ldPair();
+  const t = DATA[CODE_INDEX[code]], e = ELSST[eid];
+  const ctx = CTX[eid] || {};
+  const ex = existingLink(code, eid);
+  $('#ldDetail').innerHTML = `
+    <div class="ld-pair">
+      <div><span class="label">OntoPop class</span><div><b>${esc(t.label)}</b> <span class="hint">${esc(code)}</span></div>
+        <div class="ld-sub">${esc(t.gloss || '')}</div></div>
+      <div><span class="label">ELSST concept</span><div><b><a href="${esc(eid)}" target="_blank" rel="noopener">${esc(e.l)} ↗</a></b></div>
+        <div class="ld-sub">${e.d ? esc(e.d) : '<i>No ELSST definition.</i>'}</div>
+        ${ctx.asc?.length ? `<div class="hint">Broader: ${ctx.asc.map(esc).join(' › ')}</div>` : ''}
+        ${ctx.narr?.length ? `<div class="hint">Narrower: ${ctx.narr.map(esc).join(', ')}</div>` : ''}</div>
+    </div>`;
+  $('#ldExisting').innerHTML = ex
+    ? `This pair is ${esc(ex)} — vote on it there instead. <button class="linkbtn" id="ldOpen">Open it</button>` : '';
+  $('#ldExisting').hidden = !ex;
+  $('#ldTypes').innerHTML = LINK_TYPES.map(tp =>
+    `<button type="button" data-v="${tp}" class="t-${tp}${tp === LD.t ? ' sel' : ''}" title="${esc(META.type_defs?.[tp] || '')}"${ex ? ' disabled' : ''}>${tp}</button>`).join('');
+  $('#ldSentence').innerHTML = LD.t ? relSentence(LD.t, t.label, e.l) : '<span class="hint">Choose the relation, read from the OntoPop class to the ELSST concept.</span>';
+  $('#ldNote').disabled = !!ex;
+  $('#ldAdd').disabled = !!ex || !LD.t;
+}
+$('#ldSearch').addEventListener('input', () => renderLinkResults());
+$('#ldSearch').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); if (LD.results[0]) { LD.target = LD.results[0].id ?? LD.results[0].code; renderLinkResults(); renderLinkPick(); } }
+});
+$('#ldResults').addEventListener('click', e => {
+  const r = e.target.closest('.ld-res'); if (!r) return;
+  LD.target = r.dataset.id; renderLinkResults(); renderLinkPick();
+});
+$('#ldTypes').addEventListener('click', e => {
+  const b = e.target.closest('button[data-v]'); if (!b || b.disabled) return;
+  LD.t = b.dataset.v; renderLinkPick();
+});
+$('#ldExisting').addEventListener('click', e => {
+  if (e.target.id !== 'ldOpen') return;
+  const { code, eid } = ldPair();
+  $('#linkDlg').close();
+  go(code, pkOf(code, eid));
+});
+$('#ldCancel').onclick = () => $('#linkDlg').close();
+$('#ldAdd').onclick = () => {
+  const rid = me();
+  if (!rid || !LD.target || !LD.t) return;
+  const { code, eid } = ldPair();
+  if (existingLink(code, eid)) { renderLinkPick(); return; }
+  const note = $('#ldNote').value.trim().slice(0, NOTE_MAX);
+  STORE.addLink(code, eid, rid, LD.t, note);
+  $('#linkDlg').close();
+  const label = DATA[CODE_INDEX[code]].label;
+  if (code === cur) {
+    const pk = pkOf(code, eid);
+    STICKY.add(pk); renderAll();
+    $('#wrap').querySelector(`.cand[data-pk="${CSS.escape(pk)}"]`)?.scrollIntoView({ block: 'center' });
+    toast(`Link added: ${ELSST[eid].l} (${LD.t}).`);
+  } else {
+    renderAll();
+    toast(`Link added to OntoPop “${label}” (${LD.t}).`);
+  }
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// Human review log: every human vote in one filterable, sortable table.
+// ════════════════════════════════════════════════════════════════════════════
+const LOG_COLS = [
+  { k: 'onto',  label: 'OntoPop class',   filter: 'text' },
+  { k: 'gpt',   label: 'gpt-4o relation', filter: 'select' },
+  { k: 'elsst', label: 'ELSST concept',   filter: 'text' },
+  { k: 'rev',   label: 'Reviewer',        filter: 'select' },
+  { k: 'inst',  label: 'Institution',     filter: 'select' },
+  { k: 'vote',  label: 'Reviewer vote',   filter: 'select' },
+  { k: 'note',  label: 'Note',            filter: 'text' },
+  { k: 'when',  label: 'Date',            filter: 'select' },
+];
+const LOGF = {};                          // column key -> filter value
+let logSort = { k: 'when', dir: -1 };
+let logLimit = 500;
+
+function logRows(){
+  const rows = [];
+  for (const sh of Object.values(SHARDS)) {
+    for (const [pk, byRid] of Object.entries(sh.v || {})) {
+      const code = pk.slice(0, pk.indexOf('|'));
+      const t = DATA[CODE_INDEX[code]];
+      if (!t) continue;
+      const cand = CAND[pk], addedLink = sh.x?.[pk];
+      const eid = cand ? cand.elsst_id : addedLink?.e || ELSST_BY_UUID[pk.slice(pk.indexOf('|') + 1)];
+      for (const [rid, v] of Object.entries(byRid || {})) {
+        if (!v || !v.t) continue;
+        const r = REVIEWERS[rid] || {};
+        rows.push({ pk, code, eid, onto: t.label,
+          gpt: cand ? cand.match_type : addedLink ? 'added' : 'unknown', gptWhy: cand?.rationale || '',
+          elsst: ELSST[eid]?.l || '(unknown ELSST concept)',
+          rev: r.name || 'Unknown reviewer', inst: r.affiliation || '',
+          vote: v.t, note: v.n || '', when: v.u || v.c || 0 });
+      }
+    }
+  }
+  return rows;
+}
+const gptLabel = g => g === 'added' ? 'reviewer-added' : g === 'unknown' ? 'not a candidate' : typeLabel(g);
+
+function initLog(){
+  const head = LOG_COLS.map(c => `<th data-sort="${c.k}">${c.label}<span class="sort"></span></th>`).join('');
+  const filt = LOG_COLS.map(c => c.filter === 'text'
+    ? `<th><input data-f="${c.k}" type="search" placeholder="filter…"></th>`
+    : `<th><select data-f="${c.k}"></select></th>`).join('');
+  $('#logView').innerHTML = `
+    <div class="log-top">
+      <h2>Human review log</h2>
+      <span id="logCount" class="hint"></span>
+      <button class="linkbtn" id="logClear">clear filters</button>
+    </div>
+    <p class="hint log-help">Every vote by a human reviewer. Use the boxes under each heading to filter, click a heading
+      to sort, and click an OntoPop class to open that link for review. Hover a gpt-4o relation to see its rationale.</p>
+    <div class="log-scroll"><table class="log">
+      <thead><tr>${head}</tr><tr class="log-filters">${filt}</tr></thead>
+      <tbody id="logBody"></tbody></table></div>
+    <div id="logMore"></div>`;
+  const lv = $('#logView');
+  lv.addEventListener('input', e => {
+    const f = e.target.dataset.f; if (!f) return;
+    LOGF[f] = e.target.value; logLimit = 500; renderLogBody();
+  });
+  lv.addEventListener('click', e => {
+    const pl = e.target.closest('.plink');
+    if (pl) { go(pl.dataset.code, pl.dataset.pk); return; }
+    const th = e.target.closest('th[data-sort]');
+    if (th) {
+      const k = th.dataset.sort;
+      logSort = logSort.k === k ? { k, dir: -logSort.dir } : { k, dir: k === 'when' ? -1 : 1 };
+      renderLogBody(); return;
+    }
+    if (e.target.id === 'logClear') {
+      for (const k in LOGF) delete LOGF[k];
+      lv.querySelectorAll('[data-f]').forEach(el => { el.value = ''; });
+      renderLogBody(); return;
+    }
+    if (e.target.id === 'logShowAll') { logLimit = Infinity; renderLogBody(); }
+  });
+}
+
+// Refresh the select options (reviewers etc. change as votes arrive), keeping
+// the current choices, then the rows.
+function renderLog(){
+  $('.layout').hidden = true;
+  $('#logView').hidden = false;
+  const rows = logRows();
+  const distinct = k => [...new Set(rows.map(r => r[k]).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  const opts = {
+    gpt:  [['', 'any'], ...TYPES.map(t => [t, typeLabel(t)]), ['added', 'reviewer-added']],
+    rev:  [['', 'any'], ...distinct('rev').map(v => [v, v])],
+    inst: [['', 'any'], ...distinct('inst').map(v => [v, v])],
+    vote: [['', 'any'], ...TYPES.map(t => [t, typeLabel(t)]), ['=gpt', 'same as gpt-4o'], ['!=gpt', 'differs from gpt-4o']],
+    when: [['', 'any time'], ['1', 'last 24 hours'], ['7', 'last 7 days'], ['30', 'last 30 days']],
+  };
+  for (const [k, list] of Object.entries(opts)) {
+    const sel = $(`#logView select[data-f="${k}"]`);
+    const keep = LOGF[k] || '';
+    sel.innerHTML = list.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join('');
+    if (keep && !list.some(([v]) => v === keep)) sel.insertAdjacentHTML('beforeend', `<option value="${esc(keep)}">${esc(keep)}</option>`);
+    sel.value = keep;
+  }
+  renderLogBody(rows);
+}
+
+function renderLogBody(rows = logRows()){
+  const now = Date.now();
+  const txt = (k, val) => !LOGF[k] || val.toLowerCase().includes(LOGF[k].trim().toLowerCase());
+  const filtered = rows.filter(r =>
+    (txt('onto', r.onto) || txt('onto', r.code)) && txt('elsst', r.elsst) && txt('note', r.note) &&
+    (!LOGF.gpt  || r.gpt === LOGF.gpt) &&
+    (!LOGF.rev  || r.rev === LOGF.rev) &&
+    (!LOGF.inst || r.inst === LOGF.inst) &&
+    (!LOGF.vote || (LOGF.vote === '=gpt' ? r.vote === r.gpt
+                  : LOGF.vote === '!=gpt' ? (r.gpt !== 'added' && r.gpt !== 'unknown' && r.vote !== r.gpt)
+                  : r.vote === LOGF.vote)) &&
+    (!LOGF.when || now - r.when <= +LOGF.when * 86400000));
+  const { k, dir } = logSort;
+  filtered.sort((a, b) => (k === 'when' ? a.when - b.when
+    : k === 'gpt' || k === 'vote' ? TYPES.indexOf(a[k]) - TYPES.indexOf(b[k])
+    : String(a[k]).localeCompare(String(b[k]), undefined, { sensitivity: 'base' })) * dir
+    || b.when - a.when);
+
+  $('#logView').querySelectorAll('th[data-sort]').forEach(th =>
+    th.querySelector('.sort').textContent = th.dataset.sort === k ? (dir > 0 ? ' ▲' : ' ▼') : '');
+  const links = new Set(rows.map(r => r.pk)).size, people = new Set(rows.map(r => r.rev)).size;
+  $('#logCount').textContent = `${filtered.length.toLocaleString()} of ${rows.length.toLocaleString()} votes shown` +
+    ` · ${links.toLocaleString()} links · ${people} reviewer${people === 1 ? '' : 's'}`;
+
+  const shown = filtered.slice(0, logLimit);
+  const badge = t => `<span class="badge b-${esc(t)}">${esc(typeLabel(t))}</span>`;
+  $('#logBody').innerHTML = shown.length ? shown.map(r => `<tr>
+      <td><a class="plink" data-code="${esc(r.code)}" data-pk="${esc(r.pk)}">${esc(r.onto)}</a> <span class="hint">${esc(r.code)}</span></td>
+      <td>${r.gpt === 'added' || r.gpt === 'unknown' ? `<span class="badge b-added">${gptLabel(r.gpt)}</span>`
+            : `<span class="badge b-${esc(r.gpt)}" title="${esc(r.gptWhy)}">${esc(typeLabel(r.gpt))}</span>`}</td>
+      <td><a href="${esc(r.eid)}" target="_blank" rel="noopener">${esc(r.elsst)}</a></td>
+      <td>${esc(r.rev)}</td>
+      <td>${esc(r.inst)}</td>
+      <td>${badge(r.vote)}${r.gpt !== 'added' && r.gpt !== 'unknown' && r.vote !== r.gpt ? ' <span class="diff" title="Differs from gpt-4o">≠</span>' : ''}</td>
+      <td class="lnote">${esc(r.note)}</td>
+      <td class="lwhen" title="${r.when ? esc(new Date(r.when).toLocaleString()) : ''}">${fmtTime(r.when)}</td>
+    </tr>`).join('')
+    : `<tr><td colspan="${LOG_COLS.length}" class="empty">${rows.length ? 'No votes match these filters.' : 'No human votes yet.'}</td></tr>`;
+  $('#logMore').innerHTML = filtered.length > shown.length
+    ? `<button id="logShowAll">Show all ${filtered.length.toLocaleString()} rows</button>` : '';
+}
+
+$('#logBtn').onclick = () => {
+  if (view === 'log') go(cur || prefs.lastCode || ROOTS[0]);
+  else location.hash = 'log';
+};
+
 // Keep the sticky sidebar flush under the header, which can wrap.
 function setHeadOffset(){
   document.documentElement.style.setProperty('--head', $('header').offsetHeight + 'px');
@@ -839,9 +1299,20 @@ async function boot(){
     fetch('review.json').then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); }),
   ]);
   META = data.meta || {}; DATA = data.terms; CTX = data.elsst_ctx || {}; XREF = data.xref || {};
+  ELSST = data.elsst || {};
+  for (const id in ELSST) ELSST_BY_UUID[uuidOf(id)] = id;
+  // Candidates carry only the ELSST id; hydrate label/definition once here.
+  for (const t of DATA) for (const c of t.candidates) {
+    const e = ELSST[c.elsst_id] || {};
+    c.elsst_label = e.l ?? c.elsst_label; c.elsst_def = e.d ?? c.elsst_def ?? null;
+    c.code = t.code;
+    CAND[pkOf(t.code, c.elsst_id)] = c;
+  }
   $('#rulesBody').innerHTML = data.rules_html || '';
   buildHierarchy();
   buildIndex();
+  buildElsstIndex();
+  initLog();
 
   const fb = Object.fromEntries(Object.entries(cfg.firebase || {}).filter(([, v]) => v));
   const useFirebase = fb.apiKey && fb.projectId && !params.has('local');
@@ -856,6 +1327,7 @@ async function boot(){
   const start = decodeURIComponent(location.hash.slice(1));
   show(start in CODE_INDEX ? start : (prefs.lastCode in CODE_INDEX ? prefs.lastCode : ROOTS[0]),
        { scrollTop: false });
+  if (start === 'log') route();
   setHeadOffset();
 }
 
